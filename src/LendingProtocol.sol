@@ -35,7 +35,7 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         EnumerableSet.Bytes32Set borrowMarkets;
     }
 
-    mapping(bytes32 => Market) markets;
+    mapping(bytes32 => Market) public markets;
     mapping(address => UserData) usersData;
 
     event MarketCreated(bytes32 indexed marketId, string indexed marketName, address indexed asset, uint256 supplyCap, uint256 borrowCap);
@@ -61,13 +61,13 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         _unpause();
     }
 
-    function _encodeMarketIdentifier(string memory _marketName, address _asset) internal pure returns (bytes32 _marketId) {
+    function encodeMarketIdentifier(string memory _marketName, address _asset) public pure returns (bytes32 _marketId) {
         _marketId = keccak256(abi.encode(_marketName, _asset));
     }
 
     function createMarket(string memory _marketName, address _asset, uint256 _supplyCap, uint256 _borrowCap, uint256 _ltv, uint256 _staticPrice) external onlyOwner() whenNotPaused() nonReentrant() {
-        bytes32 _marketId = _encodeMarketIdentifier(_marketName, _asset);
-        require(markets[_marketId].supplyCap == 0, "Market already exist");
+        bytes32 _marketId = encodeMarketIdentifier(_marketName, _asset);
+        require(markets[_marketId].supplyCap == 0, "Market already exists");
         require(bytes(_marketName).length > 0, "Market name can not be empty");
         require(_asset != address(0), "Invalid asset");
         require(_supplyCap > 0, "Supply cap can not be zero");
@@ -77,11 +77,13 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
 
         Market storage _market = markets[_marketId];
         
+        _market.asset = _asset;
         _market.supplyCap = _supplyCap;
         _market.borrowCap = _borrowCap;
         _market.ltv = _ltv;
         _market.isActive = true;
         _market.staticPrice = _staticPrice;
+        emit MarketCreated(_marketId, _marketName, _asset, _supplyCap, _borrowCap);
     }
 
     function lend(bytes32 _marketId, uint256 _amount) external whenNotPaused() nonReentrant() activeMarket(_marketId) {
@@ -89,7 +91,6 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         Market storage _market = markets[_marketId];
         
         require(_amount > 0, "Amount can not be zero");
-        require(_market.asset != address(0), "This is not the function to deposit ether market");
         require(_market.totalSupply + _amount <= _market.supplyCap, "Supply cap exceeded");
 
         _user.totalSupplied[_marketId] += _amount;
@@ -106,14 +107,14 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
     function withdraw(bytes32 _marketId, uint256 _amount) external whenNotPaused() nonReentrant() activeMarket(_marketId) {
         require(_amount > 0, "Amount can not be zero");
         UserData storage _user = usersData[msg.sender];
-        Market storage _market = markets[_marketId];
+        require(_user.totalSupplied[_marketId] >= _amount, "Not enough supplied in this market");
 
+        Market storage _market = markets[_marketId];        
         uint256 _assetPrice = _market.staticPrice;
         uint256 _withdrawInUsd = _amount * _assetPrice;
         uint256 _healthFactor = getHealthFactor(msg.sender, _withdrawInUsd, 0);
         require(_healthFactor > 0, "Not enough collateral to withdraw");
 
-        require(_user.totalSupplied[_marketId] >= _amount, "Not enough supplied in this market");
 
         _user.totalSupplied[_marketId] -= _amount;
         _user.lastUpdateTime = block.timestamp;
@@ -121,17 +122,12 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
             _user.collateralMarkets.remove(_marketId);
         }
         _market.totalSupply -= _amount;
+        IERC20(_market.asset).safeTransfer(msg.sender, _amount);
 
-        if (_market.asset == address(0)) {
-            (bool success, ) = msg.sender.call{value: _amount}("");
-            require(success, "Ether transfer failed");
-        } else {
-            IERC20(_market.asset).safeTransfer(msg.sender, _amount);
-        }
         emit Withdraw(_marketId, msg.sender, _amount);
     }
 
-    function getCollateralUsd(address _userAddress) internal view returns (uint256 _totalCollateral, uint256 _totalUsable, uint256 _totalBorrowed){
+    function getCollateralUsd(address _userAddress) public view returns (uint256 _totalCollateral, uint256 _totalUsable, uint256 _totalBorrowed){
         UserData storage _user = usersData[_userAddress];
 
         for (uint256 i = 0; i < _user.collateralMarkets.length(); i++) {
@@ -141,7 +137,7 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
                 uint256 _assetPrice = markets[_marketId].staticPrice;
                 uint256 _suppliedMarketInUsd = _suppliedMarket * _assetPrice;
                 _totalCollateral += _suppliedMarketInUsd;
-                _totalUsable += _suppliedMarketInUsd * markets[_marketId].ltv;
+                _totalUsable += _suppliedMarketInUsd * markets[_marketId].ltv / BASIS_POINTS;
             }
         }
 
@@ -151,21 +147,27 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
             if (_borrowedMarket > 0) {
                 uint256 _assetPrice = markets[_marketId].staticPrice;
                 uint256 _borrowedMarketInUsd = _borrowedMarket * _assetPrice;
-                _totalUsable -= _borrowedMarketInUsd;
                 _totalBorrowed += _borrowedMarketInUsd;
             }
+        }
+        // Calcular totalUsable restando el borrowed, pero sin underflow
+        if (_totalBorrowed < _totalUsable) {
+            _totalUsable -= _totalBorrowed;
+        } else {
+            _totalUsable = 0;
         }
     }
 
     function borrow(bytes32 _marketId, uint256 _amount) external whenNotPaused() nonReentrant() activeMarket(_marketId) {
         require(_amount > 0, "Amount can not be zero");
         Market storage _market = markets[_marketId];
+        require(_market.totalBorrowed + _amount <= _market.totalSupply, "Total borrow exceed total supply");
         require(_market.totalBorrowed + _amount <= _market.borrowCap, "Borrow cap exceeded");
         
         uint256 _assetPrice = _market.staticPrice;
         uint256 _borrowInUsd = _amount * _assetPrice;
         uint256 _healthFactor = getHealthFactor(msg.sender, 0, _borrowInUsd);
-        require(_healthFactor > 0, "Not enough collateral to borrow");
+        require(_healthFactor > 1, "Not enough collateral to borrow");
         
 
         UserData storage _user = usersData[msg.sender];
@@ -174,13 +176,7 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         _user.borrowMarkets.add(_marketId);
 
         _market.totalBorrowed += _amount;
-
-        if (_market.asset == address(0)) {
-            (bool success, ) = msg.sender.call{value: _amount}("");
-            require(success, "Ether transfer failed");
-        } else {
-            IERC20(_market.asset).safeTransfer(msg.sender, _amount);
-        }
+        IERC20(_market.asset).safeTransfer(msg.sender, _amount);
 
         emit Borrow(_marketId, msg.sender, _amount);
     }
@@ -190,7 +186,7 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         Market storage _market = markets[_marketId];
         UserData storage _user = usersData[msg.sender];
 
-        require(_user.totalBorrowed[_marketId] - _amount <= _amount , "Not borrowed too much from this market");
+        require(_user.totalBorrowed[_marketId] >= _amount, "Not borrowed enough from this market");
         _user.totalBorrowed[_marketId] -= _amount;
         _user.lastUpdateTime = block.timestamp;
         if (_user.totalBorrowed[_marketId] == 0) {
@@ -202,12 +198,16 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         emit Repay(_marketId, msg.sender, _amount);
     }
 
-    function getHealthFactor(address _userAddress, uint256 _newWithdrawAmount, uint256 _newBorrowAmount) internal view returns (uint256 _healthFactor) {
+    function getHealthFactor(address _userAddress, uint256 _newWithdrawAmount, uint256 _newBorrowAmount) public view returns (uint256 _healthFactor) {
         (uint256 _collateralInUsd,, uint256 _totalBorrowed) = getCollateralUsd(_userAddress);
-        if (_totalBorrowed > 0) {
-            _healthFactor = (_collateralInUsd - _newWithdrawAmount) * (LIQUIDATION_THRESHOLD / BASIS_POINTS) / (_totalBorrowed + _newBorrowAmount);
-        } else {
+        _totalBorrowed += _newBorrowAmount;
+
+        if (_collateralInUsd > 0 && _totalBorrowed > 0) {
+            _healthFactor = (_collateralInUsd - _newWithdrawAmount) * LIQUIDATION_THRESHOLD / BASIS_POINTS / (_totalBorrowed);
+        } else if (_collateralInUsd > 0 && _totalBorrowed == 0){
             _healthFactor = type(uint256).max;
+        } else {
+            _healthFactor = 0;
         }
     }
 
@@ -237,6 +237,14 @@ contract LendingProtocol is Ownable, Pausable, ReentrancyGuard {
         _user.lastUpdateTime = block.timestamp;
 
         emit Liquidate(msg.sender, _userAddress);
+    }
+
+    function getUserDepositForMarket(address _user, bytes32 _marketId) external view returns (uint256 _amount) {
+        _amount = usersData[_user].totalSupplied[_marketId];
+    }
+
+    function getUserBorrowForMarket(address _user, bytes32 _marketId) external view returns (uint256 _amount) {
+        _amount = usersData[_user].totalBorrowed[_marketId];
     }
 
 
